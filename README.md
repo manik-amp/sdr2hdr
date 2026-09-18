@@ -30,7 +30,7 @@ pkg update && pkg install ffmpeg -y
 Install or update the script with a single command:
 
 ```bash
-curl -sL [https://raw.githubusercontent.com/manik-amp/sdr2hdr/main/sdr2hdr.sh](https://raw.githubusercontent.com/manik-amp/sdr2hdr/main/sdr2hdr.sh) -o $PREFIX/bin/sdr2hdr && chmod +x $PREFIX/bin/sdr2hdr
+curl -sL https://raw.githubusercontent.com/manik-amp/sdr2hdr/main/sdr2hdr.sh -o $PREFIX/bin/sdr2hdr && chmod +x $PREFIX/bin/sdr2hdr
 ```
 
 ---
