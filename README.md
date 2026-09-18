@@ -6,3 +6,4 @@ An interactive CLI utility to convert SDR footage into true HDR10 (BT.2020 / SMP
 
 ```bash
 pkg update && pkg install ffmpeg -y
+curl -sL [https://raw.githubusercontent.com/manik-amp/sdr2hdr/main/sdr2hdr](https://raw.githubusercontent.com/manik-amp/sdr2hdr/main/sdr2hdr) -o $PREFIX/bin/sdr2hdr && chmod +x$PREFIX/bin/sdr2hdr
