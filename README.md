@@ -1,69 +1,30 @@
-# SDR to HDR10 Converter (Termux)
+# 🎬 SDR2HDR — Mobile HDR10 Video Converter
 
-Fast, high-precision CLI utility to convert SDR footage to true HDR10 (BT.2020 / SMPTE 2084) directly on Android via Termux. Features 32-bit float grading, HDR10 metadata injection, real-time encode stats, and social media presets.
-
----
-
-## Features
-
-* **32-Bit Float Color Pipeline:** High-precision floating point grading (`gbrpf32le`), exposure leveling, and SMPTE 2084 (PQ) transfer curve conversion.
-* **Metadata Injection:** Embeds static mastering display metadata (`master-display`) and light level bounds (`MaxCLL` / `MaxFALL`) for true HDR10 compliance.
-* **Automatic Colorspace Fallback:** Automatically probes input color matrices (`BT.709`, `BT.601`) and gracefully handles untagged clips.
-* **Interactive Terminal UI:** Interactive file browser, real-time progress bar, FPS counter, and dynamic ETA estimation.
-* **In-Flight Controls:** Hotkeys to pause (`P`) or abort cleanly (`Q`) during the encoding process.
-* **Platform Presets:** Tailored presets for TikTok (60fps CFR) and Instagram (30fps CFR), plus raw frame passthrough.
+A fast, high-precision CLI utility designed to convert standard dynamic range (SDR) video footage into true **HDR10 (BT.2020 / SMPTE ST 2084 PQ)** directly on Android devices via **Termux (ARM64)**.
 
 ---
 
-## Prerequisites
+## 🌟 Key Features
 
-Make sure `ffmpeg` is installed in Termux:
+- **True HDR10 Mastering:** Accurately converts standard Rec.709/sRGB color profiles to wide-gamut BT.2020 with the PQ (Perceptual Quantizer) transfer function.
+- **High-Precision Color Processing:** Uses 32-bit float color matrix grading to minimize color banding and preserve shadow/highlight details.
+- **HDR Metadata Injection:** Automatically writes essential HDR10 metadata (`Mastering Display Color Volume`, `MaxCLL`, `MaxFALL`) for native HDR display recognition on Samsung, iPhone, and OLED screens.
+- **Social Media Presets:** Tuned bitrates and color profiles optimized for Instagram Reels, TikTok HDR, and YouTube Shorts.
+- **Hardware-Aware Encoding:** Uses optimized multi-threaded ARM64 FFmpeg pipelines for maximum encoding speed without root access.
+
+---
+
+## 📋 Prerequisites
+
+1. **Termux:** Must be downloaded from [F-Droid](https://f-droid.org/packages/com.termux/) or GitHub (do **not** use the outdated Google Play Store build).
+2. **Android OS:** Android 8.0+ (ARM64 processor recommended).
+3. **Storage Space:** At least 2–4 GB free internal storage for temporary encoding passes.
+
+---
+
+## 🚀 Quick Install (One-Line Setup)
+
+Open Termux and paste the following command:
 
 ```bash
-pkg update && pkg install ffmpeg -y
-```
-
----
-
-## Installation
-
-Install or update the script with a single command:
-
-```bash
-curl -sL https://raw.githubusercontent.com/manik-amp/sdr2hdr/main/sdr2hdr.sh -o $PREFIX/bin/sdr2hdr && chmod +x $PREFIX/bin/sdr2hdr
-```
-
----
-
-## Usage
-
-### 1. Interactive Menu Mode
-Launch the interactive terminal browser:
-
-```bash
-sdr2hdr
-```
-
-### 2. Direct File Conversion
-Pass a video path directly as an argument:
-
-```bash
-sdr2hdr /sdcard/DCIM/Camera/VID_sample.mp4
-```
-
----
-
-## Controls During Encode
-
-* **`P`** : Pause / Resume encoding
-* **`Q`** : Cancel encoding and purge temporary cache files
-
----
-
-## Output Location
-
-Converted HDR10 clips are saved directly to your device storage:
-
-```text
-/sdcard/DCIM/HDR10_Converted/
-```
+termux-setup-storage && pkg update -y && pkg install git python ffmpeg -y && git clone [https://github.com/manik-amp/sdr2hdr.git](https://github.com/manik-amp/sdr2hdr.git) && cd sdr2hdr && pip install -r requirements.txt --break-system-packages && chmod +x sdr2hdr.sh && ./sdr2hdr.sh
