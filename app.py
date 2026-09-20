@@ -1,13 +1,11 @@
 import json
 import os
-import re
 import subprocess
 import threading
 from flask import Flask, jsonify, render_template, request
 
 app = Flask(__name__)
 
-# Global state tracker
 ENCODER_STATE = {
     "is_running": False,
     "current_frame": 0,
@@ -21,39 +19,45 @@ ENCODER_STATE = {
 }
 
 
-def get_exact_video_metadata(filepath):
-  """Probe video stream packet-by-packet to find the exact frame count
-
-  and avoid variable frame rate estimation issues.
-  """
+def get_fast_video_metadata(filepath):
+  """Instantly probe stream headers without scanning packets across the file."""
   cmd = [
       "ffprobe",
       "-v",
       "error",
       "-select_streams",
       "v:0",
-      "-count_packets",
       "-show_entries",
-      "stream=nb_read_packets,r_frame_rate,duration",
+      "stream=nb_frames,r_frame_rate,duration",
+      "-show_entries",
+      "format=duration",
       "-of",
       "json",
       filepath,
   ]
   try:
     proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    stream_info = json.loads(proc.stdout)["streams"][0]
+    data = json.loads(proc.stdout)
+    stream = data.get("streams", [{}])[0]
+    fmt = data.get("format", {})
 
-    packets = stream_info.get("nb_read_packets")
-    if packets and packets != "N/A":
-      return int(packets)
+    # 1. Try reading container nb_frames directly (instant)
+    nb_frames = stream.get("nb_frames")
+    if nb_frames and nb_frames != "N/A" and int(nb_frames) > 0:
+      return int(nb_frames)
 
-    # Fallback to duration * fps if packet counting fails
-    num, den = map(float, stream_info["r_frame_rate"].split("/"))
-    fps = num / den
-    duration = float(stream_info.get("duration", 0))
-    return max(1, int(round(duration * fps)))
+    # 2. Fast calculation via header duration * fps
+    dur = stream.get("duration") or fmt.get("duration")
+    r_fps = stream.get("r_frame_rate", "30/1")
+
+    if dur and dur != "N/A" and r_fps:
+      num, den = map(float, r_fps.split("/"))
+      fps = (num / den) if den > 0 else 30.0
+      return max(1, int(round(float(dur) * fps)))
+
+    return 1
   except Exception as err:
-    print(f"ffprobe error: {err}")
+    print(f"ffprobe fast probe failed: {err}")
     return 1
 
 
@@ -61,7 +65,7 @@ def run_ffmpeg_worker(input_path, output_path, exposure, max_cll, saturation):
   global ENCODER_STATE
 
   ENCODER_STATE["status"] = "Analyzing stream and staging pipeline..."
-  total_frames = get_exact_video_metadata(input_path)
+  total_frames = get_fast_video_metadata(input_path)
 
   ENCODER_STATE["total_frames"] = total_frames
   ENCODER_STATE["remaining_frames"] = total_frames
@@ -71,22 +75,26 @@ def run_ffmpeg_worker(input_path, output_path, exposure, max_cll, saturation):
   ENCODER_STATE["percentage"] = 0
   ENCODER_STATE["status"] = "Encoding HDR10 BT.2020 / PQ frames..."
 
-  # libx265 HDR10 Pipeline filtergraph
-  # Exposure/Saturation adjustment + Rec.709 to BT.2020 PQ color space matrices
+  # Your shell script's exact 32-bit float exposure and color pipeline
   vf_filter = (
-      f"eq=brightness={exposure}:saturation={saturation},"
-      "zscale=tin=bt709:t=smpte2084:m=bt2020nc:min=bt2020nc:pin=bt709:p=bt2020,"
+      f"eq=saturation={saturation},"
+      "zscale=rin=tv:r=full:d=none,"
+      "format=gbrpf32le,"
+      f"exposure={exposure},"
+      "zscale=primaries=bt2020:transfer=smpte2084:matrix=bt2020nc:npl=203,"
       "format=yuv420p10le"
   )
 
   x265_params = (
-      "hdr10-opt=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:"
-      f"colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):"
-      f"max-cll={max_cll},100"
+      "hdr10=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:"
+      "master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):"
+      f"max-cll={max_cll},{max_cll}"
   )
 
   cmd = [
       "ffmpeg",
+      "-nostdin",
+      "-hide_banner",
       "-y",
       "-i",
       input_path,
@@ -95,30 +103,49 @@ def run_ffmpeg_worker(input_path, output_path, exposure, max_cll, saturation):
       "-c:v",
       "libx265",
       "-preset",
-      "ultrafast",
+      "faster",
+      "-crf",
+      "20",
+      "-tag:v",
+      "hvc1",
+      "-color_primaries",
+      "bt2020",
+      "-color_trc",
+      "smpte2084",
+      "-colorspace",
+      "bt2020nc",
       "-x265-params",
       x265_params,
       "-c:a",
       "copy",
+      "-movflags",
+      "+faststart",
       "-progress",
       "pipe:1",
       output_path,
   ]
 
   proc = subprocess.Popen(
-      cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True
+      cmd,
+      stdout=subprocess.PIPE,
+      stderr=subprocess.DEVNULL,
+      universal_newlines=True,
   )
   ENCODER_STATE["process"] = proc
 
   for line in proc.stdout:
     line = line.strip()
     if line.startswith("frame="):
-      curr = int(line.split("=")[1].strip())
-      ENCODER_STATE["current_frame"] = curr
-      ENCODER_STATE["remaining_frames"] = max(0, total_frames - curr)
-      ENCODER_STATE["percentage"] = min(
-          100, int(round((curr / total_frames) * 100))
-      )
+      try:
+        curr = int(line.split("=")[1].strip())
+        ENCODER_STATE["current_frame"] = curr
+        ENCODER_STATE["remaining_frames"] = max(0, total_frames - curr)
+        if total_frames > 0:
+          ENCODER_STATE["percentage"] = min(
+              100, int(round((curr / total_frames) * 100))
+          )
+      except ValueError:
+        pass
     elif line.startswith("fps="):
       try:
         cur_fps = float(line.split("=")[1].strip())
@@ -140,8 +167,26 @@ def run_ffmpeg_worker(input_path, output_path, exposure, max_cll, saturation):
         pass
 
   proc.wait()
+
+  # Trigger Android Gallery scan when finished
+  if proc.returncode == 0:
+    subprocess.run(
+        [
+            "am",
+            "broadcast",
+            "-a",
+            "android.intent.action.MEDIA_SCANNER_SCAN_FILE",
+            "-d",
+            f"file://{output_path}",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    ENCODER_STATE["status"] = "Completed"
+  else:
+    ENCODER_STATE["status"] = "Failed"
+
   ENCODER_STATE["is_running"] = False
-  ENCODER_STATE["status"] = "Completed"
   ENCODER_STATE["eta"] = "00:00"
 
 
@@ -159,9 +204,9 @@ def start_encoding():
   data = request.json or {}
   input_file = data.get("input_file", "input.mp4")
   output_file = data.get("output_file", "output_hdr10.mp4")
-  exposure = float(data.get("exposure", 0.0))
+  exposure = float(data.get("exposure", 0.25))
   max_cll = int(data.get("max_cll", 240))
-  saturation = float(data.get("saturation", 1.0))
+  saturation = float(data.get("saturation", 1.25))
 
   ENCODER_STATE["is_running"] = True
   t = threading.Thread(
@@ -189,7 +234,10 @@ def get_status():
   return jsonify({
       "is_running": ENCODER_STATE["is_running"],
       "fps": f"{ENCODER_STATE['fps']:.1f}",
-      "frames_display": f"{ENCODER_STATE['remaining_frames']} / {ENCODER_STATE['total_frames']}",
+      "frames_display": (
+          f"{ENCODER_STATE['remaining_frames']} /"
+          f" {ENCODER_STATE['total_frames']}"
+      ),
       "remaining_frames": ENCODER_STATE["remaining_frames"],
       "total_frames": ENCODER_STATE["total_frames"],
       "current_frame": ENCODER_STATE["current_frame"],
@@ -201,4 +249,3 @@ def get_status():
 
 if __name__ == "__main__":
   app.run(host="0.0.0.0", port=5000, debug=False)
-                 
