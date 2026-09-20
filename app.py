@@ -1,208 +1,204 @@
+import json
 import os
 import re
-import signal
 import subprocess
-import time
-from flask import Flask, render_template, request, Response, jsonify, send_from_directory
-from werkzeug.utils import secure_filename
+import threading
+from flask import Flask, jsonify, render_template, request
 
 app = Flask(__name__)
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_FOLDER = os.path.join(BASE_DIR, 'uploads')
-CONVERT_FOLDER = os.path.join(BASE_DIR, 'converted')
-
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(CONVERT_FOLDER, exist_ok=True)
-
-current_process = None
-current_output_file = None
-
-
-def get_video_duration(filepath):
-    try:
-        cmd = [
-            'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-            '-of', 'default=noprint_wrappers=1:nokey=1', filepath
-        ]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        return float(result.stdout.strip())
-    except Exception:
-        return 0.0
+# Global state tracker
+ENCODER_STATE = {
+    "is_running": False,
+    "current_frame": 0,
+    "total_frames": 0,
+    "remaining_frames": 0,
+    "fps": 0.0,
+    "eta": "--:--",
+    "percentage": 0,
+    "status": "Idle",
+    "process": None,
+}
 
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+def get_exact_video_metadata(filepath):
+  """Probe video stream packet-by-packet to find the exact frame count
+
+  and avoid variable frame rate estimation issues.
+  """
+  cmd = [
+      "ffprobe",
+      "-v",
+      "error",
+      "-select_streams",
+      "v:0",
+      "-count_packets",
+      "-show_entries",
+      "stream=nb_read_packets,r_frame_rate,duration",
+      "-of",
+      "json",
+      filepath,
+  ]
+  try:
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    stream_info = json.loads(proc.stdout)["streams"][0]
+
+    packets = stream_info.get("nb_read_packets")
+    if packets and packets != "N/A":
+      return int(packets)
+
+    # Fallback to duration * fps if packet counting fails
+    num, den = map(float, stream_info["r_frame_rate"].split("/"))
+    fps = num / den
+    duration = float(stream_info.get("duration", 0))
+    return max(1, int(round(duration * fps)))
+  except Exception as err:
+    print(f"ffprobe error: {err}")
+    return 1
 
 
-@app.route('/convert', methods=['POST'])
-def convert():
-    global current_process, current_output_file
+def run_ffmpeg_worker(input_path, output_path, exposure, max_cll, saturation):
+  global ENCODER_STATE
 
-    file = request.files.get('video')
-    if not file or file.filename == '':
-        return Response('{"msg": "Error: No file uploaded"}\n', mimetype='application/x-ndjson')
+  ENCODER_STATE["status"] = "Analyzing stream and staging pipeline..."
+  total_frames = get_exact_video_metadata(input_path)
 
-    filename = secure_filename(file.filename)
-    unique_id = str(int(time.time()))
-    input_filename = f"in_{unique_id}_{filename}"
-    output_filename = f"hdr10_{unique_id}_{os.path.splitext(filename)[0]}.mp4"
+  ENCODER_STATE["total_frames"] = total_frames
+  ENCODER_STATE["remaining_frames"] = total_frames
+  ENCODER_STATE["current_frame"] = 0
+  ENCODER_STATE["fps"] = 0.0
+  ENCODER_STATE["eta"] = "--:--"
+  ENCODER_STATE["percentage"] = 0
+  ENCODER_STATE["status"] = "Encoding HDR10 BT.2020 / PQ frames..."
 
-    input_path = os.path.join(UPLOAD_FOLDER, input_filename)
-    output_path = os.path.join(CONVERT_FOLDER, output_filename)
-    current_output_file = output_path
+  # libx265 HDR10 Pipeline filtergraph
+  # Exposure/Saturation adjustment + Rec.709 to BT.2020 PQ color space matrices
+  vf_filter = (
+      f"eq=brightness={exposure}:saturation={saturation},"
+      "zscale=tin=bt709:t=smpte2084:m=bt2020nc:min=bt2020nc:pin=bt709:p=bt2020,"
+      "format=yuv420p10le"
+  )
 
-    file.save(input_path)
-    total_duration = get_video_duration(input_path)
+  x265_params = (
+      "hdr10-opt=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:"
+      f"colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):"
+      f"max-cll={max_cll},100"
+  )
 
-    exp = float(request.form.get('exp', 0.25))
-    hl = int(request.form.get('hl', 240))
-    sat = float(request.form.get('sat', 1.25))
-    speed = request.form.get('speed', 'medium')
-    platform = request.form.get('platform', 'none')
+  cmd = [
+      "ffmpeg",
+      "-y",
+      "-i",
+      input_path,
+      "-vf",
+      vf_filter,
+      "-c:v",
+      "libx265",
+      "-preset",
+      "ultrafast",
+      "-x265-params",
+      x265_params,
+      "-c:a",
+      "copy",
+      "-progress",
+      "pipe:1",
+      output_path,
+  ]
 
-    brightness_val = round(exp * 0.15, 3)
-    max_fall = int(hl * 0.75)
+  proc = subprocess.Popen(
+      cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True
+  )
+  ENCODER_STATE["process"] = proc
 
-    # Color grading pipeline: Exposure/Saturation graded before zscale PQ/BT.2020 conversion
-    vf_filters = [
-        f"eq=brightness={brightness_val}:saturation={sat}",
-        "zscale=tin=bt709:t=smpte2084:pin=bt709:p=bt2020:m=bt2020nc",
-        "format=yuv420p10le"
-    ]
+  for line in proc.stdout:
+    line = line.strip()
+    if line.startswith("frame="):
+      curr = int(line.split("=")[1].strip())
+      ENCODER_STATE["current_frame"] = curr
+      ENCODER_STATE["remaining_frames"] = max(0, total_frames - curr)
+      ENCODER_STATE["percentage"] = min(
+          100, int(round((curr / total_frames) * 100))
+      )
+    elif line.startswith("fps="):
+      try:
+        cur_fps = float(line.split("=")[1].strip())
+        ENCODER_STATE["fps"] = cur_fps
 
-    fps_flag = []
-    bitrate_flag = []
-    if platform == 'tiktok':
-        fps_flag = ['-r', '60']
-        bitrate_flag = ['-maxrate', '16M', '-bufsize', '32M']
-    elif platform == 'instagram':
-        fps_flag = ['-r', '30']
-        bitrate_flag = ['-maxrate', '14M', '-bufsize', '28M']
-
-    x265_opts = (
-        f"colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:"
-        f"master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1):"
-        f"max-cll={hl},{max_fall}:hdr10-opt=1:repeat-headers=1"
-    )
-
-    cmd = [
-        'ffmpeg', '-y', '-i', input_path,
-        '-vf', ','.join(vf_filters),
-        *fps_flag,
-        '-c:v', 'libx265',
-        '-preset', speed,
-        '-crf', '18',
-        *bitrate_flag,
-        '-pix_fmt', 'yuv420p10le',
-        '-color_primaries', 'bt2020',
-        '-color_trc', 'smpte2084',
-        '-colorspace', 'bt2020nc',
-        '-x265-params', x265_opts,
-        '-c:a', 'aac', '-b:a', '256k',
-        '-movflags', '+faststart',
-        output_path
-    ]
-
-    def generate_progress():
-        global current_process
-        current_process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True
-        )
-
-        time_pattern = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
-        fps_pattern = re.compile(r"fps=\s*([\d\.]+)")
-        frame_pattern = re.compile(r"frame=\s*(\d+)")
-
-        last_pct = 0
-        while True:
-            line = current_process.stdout.readline()
-            if not line and current_process.poll() is not None:
-                break
-
-            if line:
-                t_match = time_pattern.search(line)
-                fps_match = fps_pattern.search(line)
-                frame_match = frame_pattern.search(line)
-
-                cur_fps = fps_match.group(1) if fps_match else "--"
-                cur_frames = frame_match.group(1) if frame_match else "--"
-
-                if t_match and total_duration > 0:
-                    hours, mins, secs = map(float, t_match.groups())
-                    current_secs = hours * 3600 + mins * 60 + secs
-                    pct = min(99, int((current_secs / total_duration) * 100))
-                    rem_secs = max(0, int((total_duration - current_secs) / (float(cur_fps) if cur_fps != '--' and float(cur_fps) > 0 else 30)))
-                    eta_str = f"{rem_secs // 60}:{rem_secs % 60:02d}"
-
-                    if pct > last_pct:
-                        last_pct = pct
-                        yield f'{{"pct": {pct}, "fps": "{cur_fps}", "frames": "{cur_frames}", "eta": "{eta_str}", "msg": "Encoding HDR10 BT.2020 / PQ frames..."}}\n'
-
-        ret = current_process.poll()
-        if ret == 0:
-            yield f'{{"pct": 100, "fps": "--", "frames": "{cur_frames}", "eta": "Done", "download_url": "/download/{output_filename}"}}\n'
+        rem = ENCODER_STATE["remaining_frames"]
+        if cur_fps > 0 and rem > 0:
+          eta_sec = int(rem / cur_fps)
+          m, s = divmod(eta_sec, 60)
+          h, m = divmod(m, 60)
+          ENCODER_STATE["eta"] = (
+              f"{h}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
+          )
+        elif rem == 0 and total_frames > 0:
+          ENCODER_STATE["eta"] = "00:00"
         else:
-            yield '{"msg": "Process interrupted or stopped."}\n'
+          ENCODER_STATE["eta"] = "--:--"
+      except ValueError:
+        pass
 
-        if os.path.exists(input_path):
-            try:
-                os.remove(input_path)
-            except OSError:
-                pass
-
-    return Response(generate_progress(), mimetype='application/x-ndjson')
-
-
-@app.route('/pause', methods=['POST'])
-def pause_process():
-    global current_process
-    if current_process and current_process.poll() is None:
-        try:
-            current_process.send_signal(signal.SIGSTOP)
-            return jsonify({'status': 'paused'})
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    return jsonify({'error': 'No active process'}), 400
+  proc.wait()
+  ENCODER_STATE["is_running"] = False
+  ENCODER_STATE["status"] = "Completed"
+  ENCODER_STATE["eta"] = "00:00"
 
 
-@app.route('/resume', methods=['POST'])
-def resume_process():
-    global current_process
-    if current_process and current_process.poll() is None:
-        try:
-            current_process.send_signal(signal.SIGCONT)
-            return jsonify({'status': 'resumed'})
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    return jsonify({'error': 'No active process'}), 400
+@app.route("/")
+def index():
+  return render_template("index.html")
 
 
-@app.route('/stop', methods=['POST'])
-def stop_process():
-    global current_process, current_output_file
-    if current_process and current_process.poll() is None:
-        try:
-            current_process.kill()
-            current_process = None
-            if current_output_file and os.path.exists(current_output_file):
-                os.remove(current_output_file)
-            return jsonify({'status': 'stopped'})
-        except Exception as e:
-            return jsonify({'error': str(e)}), 500
-    return jsonify({'status': 'idle'})
+@app.route("/start", methods=["POST"])
+def start_encoding():
+  global ENCODER_STATE
+  if ENCODER_STATE["is_running"]:
+    return jsonify({"error": "Encoder already running"}), 400
+
+  data = request.json or {}
+  input_file = data.get("input_file", "input.mp4")
+  output_file = data.get("output_file", "output_hdr10.mp4")
+  exposure = float(data.get("exposure", 0.0))
+  max_cll = int(data.get("max_cll", 240))
+  saturation = float(data.get("saturation", 1.0))
+
+  ENCODER_STATE["is_running"] = True
+  t = threading.Thread(
+      target=run_ffmpeg_worker,
+      args=(input_file, output_file, exposure, max_cll, saturation),
+  )
+  t.daemon = True
+  t.start()
+
+  return jsonify({"status": "Started"})
 
 
-@app.route('/download/<filename>')
-def download_file(filename):
-    return send_from_directory(CONVERT_FOLDER, filename, as_attachment=True)
+@app.route("/stop", methods=["POST"])
+def stop_encoding():
+  global ENCODER_STATE
+  if ENCODER_STATE["process"]:
+    ENCODER_STATE["process"].terminate()
+    ENCODER_STATE["is_running"] = False
+    ENCODER_STATE["status"] = "Aborted by user"
+  return jsonify({"status": "Stopped"})
 
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+@app.route("/status")
+def get_status():
+  return jsonify({
+      "is_running": ENCODER_STATE["is_running"],
+      "fps": f"{ENCODER_STATE['fps']:.1f}",
+      "frames_display": f"{ENCODER_STATE['remaining_frames']} / {ENCODER_STATE['total_frames']}",
+      "remaining_frames": ENCODER_STATE["remaining_frames"],
+      "total_frames": ENCODER_STATE["total_frames"],
+      "current_frame": ENCODER_STATE["current_frame"],
+      "eta": ENCODER_STATE["eta"],
+      "percentage": ENCODER_STATE["percentage"],
+      "status": ENCODER_STATE["status"],
+  })
+
+
+if __name__ == "__main__":
+  app.run(host="0.0.0.0", port=5000, debug=False)
+                 
