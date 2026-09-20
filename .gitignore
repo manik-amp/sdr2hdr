@@ -1,0 +1,26 @@
+# Temporary & Render Buffers
+uploads/
+converted/
+temp_*.mp4
+
+# Video formats (prevent large file upload limits)
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+*.flv
+*.ts
+*.m4v
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+ENV/
+
+# OS/System files
+.DS_Store
+Thumbs.db
